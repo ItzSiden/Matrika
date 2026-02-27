@@ -1,2 +1,3 @@
 # Matrika
-A native Bangla programming language for beginners. Master coding logic in your mother tongue with intuitive syntax and native Bangla keywords.
+---
+**Matrika** (মাতৃকা) is a native Bangla programming language crafted for the next generation of Bangladeshi developers. By utilizing native keywords and simplified syntax, Matrika removes the English language barrier, making the world of programming accessible to everyone in their mother tongue.

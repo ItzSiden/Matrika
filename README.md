@@ -4,6 +4,7 @@
 ---
 ```bash
 # MSYS2 MinGW64 terminal এ:
+cd /c/Users/Hello/Desktop/Matrika
 gcc -O2 -std=c99 -o matrika.exe src/matrika.c
 ```
 

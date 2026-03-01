@@ -6,6 +6,7 @@
 # MSYS2 MinGW64 terminal এ:
 cd /c/Users/Hello/Desktop/Matrika
 gcc -O2 -std=c99 -o matrika.exe src/matrika.c
+gcc -O2 -std=c99 src/matrika.c -o matrika.exe
 ```
 
 ---

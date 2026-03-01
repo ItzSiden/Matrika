@@ -1,0 +1,154 @@
+1️⃣ Clean AST Structure (Mandatory)
+
+Fix NODE_IF.
+
+🔧 Do this:
+
+Change ASTNode:
+
+Instead of abusing next for else body, modify struct:
+
+ASTNode *cond;
+ASTNode *then_branch;
+ASTNode *else_branch;
+
+Update:
+
+Parser
+
+Evaluator
+
+✅ Result: Cleaner logic, future-proof.
+
+2️⃣ Implement Proper Scope System (CRITICAL)
+
+Right now variables are global.
+
+🔧 Replace:
+g_vars[]
+
+With:
+
+Scope stack
+
+Structure idea:
+
+Scope {
+   Var vars[]
+}
+
+Maintain:
+
+push_scope()
+
+pop_scope()
+
+var_lookup() should search from top → down
+
+Push scope when:
+
+Entering block
+
+Entering function
+
+Pop when:
+
+Leaving block
+
+Returning from function
+
+✅ Without this, functions will break everything.
+
+3️⃣ Add User Defined Functions
+
+After scope system works.
+
+🔧 Add new node types:
+
+NODE_FUNC_DECL
+
+NODE_FUNC_CALL
+
+NODE_RETURN
+
+Example syntax idea:
+
+কাজ যোগ(a, b) {
+    ফিরাও a + b
+}
+
+Need:
+
+Function table
+
+Call stack
+
+Local scope per call
+
+Return handling
+
+4️⃣ Implement Return Statement
+
+Add:
+
+ফিরাও <expr>
+
+Evaluator must:
+
+Stop executing current function
+
+Pass value back
+
+Unwind scope
+
+5️⃣ Refactor ASTNode (Optional but Good)
+
+Instead of generic:
+
+char text[MAX_STR];
+double num;
+int bval;
+
+Use union:
+
+union {
+   double num;
+   char str[];
+   ...
+}
+
+Cleaner and more professional.
+
+6️⃣ Improve Error Recovery (Nice Upgrade)
+
+Right now die() exits immediately.
+
+Later:
+
+Implement panic-mode parsing
+
+Continue parsing after minor error
+
+Not urgent.
+
+7️⃣ Add Basic Standard Library
+
+Built-ins:
+
+ইনপুট()
+
+দৈর্ঘ্য()
+
+টাইপ()
+
+Makes it usable for learners.
+
+8️⃣ Add Versioning
+
+Inside main:
+
+Print:
+
+Matrika v4.0
+
+Keep version discipline.

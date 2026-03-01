@@ -1,15 +1,23 @@
 /*
- * মাতৃকা (Matrika) - v3.0
+ * মাতৃকা (Matrika) - v4.0
  * A Bengali-syntax programming language.
  *
  * Architecture:  Source → [Lexer] → Tokens → [Parser] → AST → [Evaluator]
  *
- * New in v3.0:
+ * New in v4.0:
+ *   - User-defined functions:  কাজ name(a, b) { … }
+ *   - Return statement:        ফিরাও <expr>
+ *   - Function call:           name(arg1, arg2)  (as an expression)
+ *   - Proper call stack:       call barrier isolates caller/callee scopes
+ *   - Recursion supported
+ *
+ * From v3.0:
  *   - Integer and string variables
  *   - Arithmetic:   +  -  *  /  %
  *   - Comparison:   ==  !=  <  <=  >  >=
  *   - If / else:    যদি … { … } নাহলে { … }
  *   - While loop:   যতক্ষণ … { … }
+ *   - Lexical scope stack
  *   - Clean error messages:  file:line: error: <message>
  */
 
@@ -105,6 +113,7 @@ typedef enum {
     TOK_RPAREN,
     TOK_LBRACE,
     TOK_RBRACE,
+    TOK_COMMA,    /* , — argument/parameter separator                       */
     TOK_EOF
 } TokenKind;
 
@@ -128,10 +137,12 @@ static const char *KW_WHILE   = "যতক্ষণ";  /* while                 
 static const char *KW_TRUE    = "সত্য";     /* true                       */
 static const char *KW_FALSE   = "মিথ্যা";  /* false                      */
 static const char *KW_COMMENT = "মন্তব্য"; /* comment (line comment kw)  */
+static const char *KW_FUNC    = "কাজ";      /* function declaration        */
+static const char *KW_RETURN  = "ফিরাও";   /* return statement            */
 
 static const char *KEYWORDS[] = {
     /* order matters: longer strings first when prefix-sharing */
-    "ধরি", "বল", "যদি", "নাহলে", "যতক্ষণ", "মন্তব্য", NULL
+    "ধরি", "বল", "যদি", "নাহলে", "যতক্ষণ", "মন্তব্য", "কাজ", "ফিরাও", NULL
 };
 
 /* ── UTF-8 helpers ──────────────────────────────────────────────────── */
@@ -149,7 +160,7 @@ static int lex_is_delimiter(char c) {
            c == '+' || c == '-'  || c == '*'  || c == '/'  || c == '%' ||
            c == '=' || c == '!'  || c == '<'  || c == '>'  ||
            c == '(' || c == ')'  || c == '{'  || c == '}'  ||
-           c == '#' || c == '"';
+           c == '#' || c == '"'  || c == ',';
 }
 
 /* Copy one UTF-8 word (up to next delimiter) into buf. Returns ptr past word. */
@@ -234,6 +245,9 @@ static void lex(const char *source[], int num_lines) {
             /* Parens */
             if (*s == '(') { tok->kind = TOK_LPAREN; tok->text[0] = '('; tok->text[1] = '\0'; g_tok_count++; s++; continue; }
             if (*s == ')') { tok->kind = TOK_RPAREN; tok->text[0] = ')'; tok->text[1] = '\0'; g_tok_count++; s++; continue; }
+
+            /* Comma */
+            if (*s == ',') { tok->kind = TOK_COMMA;  tok->text[0] = ','; tok->text[1] = '\0'; g_tok_count++; s++; continue; }
 
             /* Two-char comparison operators */
             if ((*s == '=' && *(s+1) == '=') ||
@@ -350,18 +364,23 @@ static void lex(const char *source[], int num_lines) {
  * SECTION 3 — AST
  *
  * Node kinds:
- *   NODE_BLOCK      list of statements (body)
- *   NODE_ASSIGN     ধরি <ident> = <expr>
- *   NODE_PRINT      বল(<expr>)
- *   NODE_IF         যদি <cond> { <body> } [নাহলে { <body> }]
- *   NODE_WHILE      যতক্ষণ <cond> { <body> }
- *   NODE_BINOP      <expr> <arith-op> <expr>
- *   NODE_CMP        <expr> <cmp-op>  <expr>
+ *   NODE_BLOCK        list of statements (body)
+ *   NODE_ASSIGN       ধরি <ident> = <expr>
+ *   NODE_PRINT        বল(<expr>)
+ *   NODE_IF           যদি <cond> { <body> } [নাহলে { <body> }]
+ *   NODE_WHILE        যতক্ষণ <cond> { <body> }
+ *   NODE_FUNC_DECL    কাজ name(p1,p2) { body }
+ *   NODE_FUNC_CALL    name(arg1, arg2)  — expression
+ *   NODE_RETURN       ফিরাও <expr>
+ *   NODE_BINOP        <expr> <arith-op> <expr>
+ *   NODE_CMP          <expr> <cmp-op>  <expr>
  *   NODE_NUMBER_LIT
  *   NODE_STRING_LIT
  *   NODE_BOOL_LIT
  *   NODE_IDENT
  * ═══════════════════════════════════════════════════════════════════════ */
+
+#define MAX_PARAMS  32   /* max parameters per function                    */
 
 typedef enum {
     NODE_BLOCK,
@@ -369,6 +388,9 @@ typedef enum {
     NODE_PRINT,
     NODE_IF,
     NODE_WHILE,
+    NODE_FUNC_DECL,
+    NODE_FUNC_CALL,
+    NODE_RETURN,
     NODE_BINOP,
     NODE_CMP,
     NODE_NUMBER_LIT,
@@ -386,13 +408,43 @@ struct ASTNode {
     double   num;                /* numeric literal value                  */
     int      bval;               /* boolean literal value                  */
 
-    /* Generic child pointers */
+    /* Generic child pointers (binary ops, assign, print, while) */
     ASTNode *left;               /* condition / lhs / body                 */
-    ASTNode *right;              /* rhs / else-body                        */
+    ASTNode *right;              /* rhs / then-body (while)                */
+
+    /* Dedicated NODE_IF branches — avoids abusing next as a side-channel */
+    ASTNode *cond;               /* if: condition expression               */
+    ASTNode *then_branch;        /* if: body executed when cond is truthy  */
+    ASTNode *else_branch;        /* if: body executed otherwise (may be NULL) */
+
+    /*
+     * Function support — stored as indices into separate flat pools so
+     * the node struct stays small (avoids BSS overflow with 64 K nodes).
+     *
+     *   NODE_FUNC_DECL: text = name, param_count = arity,
+     *                   param_base = first index into g_param_pool[],
+     *                   left = body (NODE_BLOCK)
+     *   NODE_FUNC_CALL: text = name, param_count = argc,
+     *                   arg_base = first index into g_arg_pool[]
+     *   NODE_RETURN:    left = return-value expression (NULL → return 0)
+     */
+    int      param_count;   /* arity (decl) or arg count (call)           */
+    int      param_base;    /* index into g_param_pool[] for decl params  */
+    int      arg_base;      /* index into g_arg_pool[]   for call args    */
 
     /* Linked list of statements inside a block */
     ASTNode *next;
 };
+
+/* ── Separate pools for function params and call args ───────────────── */
+#define MAX_TOTAL_PARAMS  1024   /* sum over all declared functions       */
+#define MAX_TOTAL_ARGS    4096   /* sum over all call sites in the AST    */
+
+static char     g_param_pool[MAX_TOTAL_PARAMS][MAX_VAR_NAME];
+static int      g_param_pool_top = 0;
+
+static ASTNode *g_arg_pool[MAX_TOTAL_ARGS];
+static int      g_arg_pool_top = 0;
 
 static ASTNode  g_ast_pool[MAX_AST_NODES];
 static int      g_ast_used = 0;
@@ -415,16 +467,20 @@ static ASTNode *ast_new(NodeKind kind, int line) {
  *   program    → block EOF
  *   block      → stmt*
  *   stmt       → assign | print | if_stmt | while_stmt
+ *              | func_decl | return_stmt
  *   assign     → KW("ধরি") IDENT '=' expr
  *   print      → KW("বল") '(' expr ')'
  *   if_stmt    → KW("যদি") expr '{' block '}' [KW("নাহলে") '{' block '}']
  *   while_stmt → KW("যতক্ষণ") expr '{' block '}'
+ *   func_decl  → KW("কাজ") IDENT '(' [IDENT (',' IDENT)*] ')' '{' block '}'
+ *   return_stmt→ KW("ফিরাও") expr
  *   expr       → cmp_expr
  *   cmp_expr   → add_expr (CMP add_expr)*
  *   add_expr   → mul_expr (('+' | '-') mul_expr)*
  *   mul_expr   → unary  (('*' | '/' | '%') unary)*
  *   unary      → '-' unary | factor
- *   factor     → NUMBER | STRING | BOOL | IDENT | '(' expr ')'
+ *   factor     → NUMBER | STRING | BOOL | IDENT ['(' arg_list ')'] | '(' expr ')'
+ *   arg_list   → [expr (',' expr)*]
  * ═══════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
@@ -479,6 +535,28 @@ static ASTNode *parse_factor(Parser *p) {
     }
     if (t->kind == TOK_IDENT) {
         par_advance(p);
+        /* Check for function call: name( ... ) */
+        if (par_peek(p)->kind == TOK_LPAREN) {
+            par_advance(p); /* consume '(' */
+            ASTNode *call = ast_new(NODE_FUNC_CALL, t->line);
+            snprintf(call->text, MAX_STR, "%s", t->text);
+            call->param_count = 0;
+            call->arg_base    = g_arg_pool_top;
+            /* Parse argument list */
+            while (par_peek(p)->kind != TOK_RPAREN) {
+                if (call->param_count >= MAX_PARAMS)
+                    die(t->line, "too many arguments in function call");
+                if (g_arg_pool_top >= MAX_TOTAL_ARGS)
+                    die(t->line, "argument pool exhausted");
+                if (call->param_count > 0)
+                    par_expect(p, TOK_COMMA, "expected ',' between arguments");
+                g_arg_pool[g_arg_pool_top++] = parse_expr(p);
+                call->param_count++;
+            }
+            par_expect(p, TOK_RPAREN, "expected ')' to close argument list");
+            return call;
+        }
+        /* Plain identifier */
         ASTNode *n = ast_new(NODE_IDENT, t->line);
         snprintf(n->text, MAX_STR, "%s", t->text);
         return n;
@@ -637,10 +715,9 @@ static ASTNode *parse_block(Parser *p) {
             }
 
             stmt = ast_new(NODE_IF, t->line);
-            stmt->left  = cond;
-            stmt->right = then_body;
-            /* Store else body in then_body->next as a side-channel */
-            then_body->next = else_body;
+            stmt->cond        = cond;
+            stmt->then_branch = then_body;
+            stmt->else_branch = else_body;
         }
 
         /* ── যতক্ষণ while ───────────────────────────────────────────── */
@@ -656,6 +733,59 @@ static ASTNode *parse_block(Parser *p) {
             stmt = ast_new(NODE_WHILE, t->line);
             stmt->left  = cond;
             stmt->right = body;
+        }
+
+        /* ── কাজ function declaration ─────────────────────────────────── */
+        else if (t->kind == TOK_KEYWORD && strcmp(t->text, KW_FUNC) == 0) {
+            par_advance(p);
+            Token *name = par_expect(p, TOK_IDENT,
+                "expected function name after 'কাজ'");
+            par_expect(p, TOK_LPAREN,
+                "expected '(' after function name");
+
+            stmt = ast_new(NODE_FUNC_DECL, t->line);
+            snprintf(stmt->text, MAX_STR, "%s", name->text);
+            stmt->param_count = 0;
+            stmt->param_base  = g_param_pool_top;
+
+            /* Parse parameter list: name, name, ... */
+            while (par_peek(p)->kind != TOK_RPAREN) {
+                if (par_peek(p)->kind == TOK_EOF)
+                    die(t->line, "unexpected end of file in parameter list");
+                if (stmt->param_count >= MAX_PARAMS)
+                    die(t->line, "too many parameters in function declaration");
+                if (g_param_pool_top >= MAX_TOTAL_PARAMS)
+                    die(t->line, "parameter pool exhausted");
+                if (stmt->param_count > 0)
+                    par_expect(p, TOK_COMMA,
+                        "expected ',' between parameter names");
+                Token *pname = par_expect(p, TOK_IDENT,
+                    "expected parameter name");
+                snprintf(g_param_pool[g_param_pool_top], MAX_VAR_NAME,
+                         "%.*s", MAX_VAR_NAME - 1, pname->text);
+                g_param_pool_top++;
+                stmt->param_count++;
+            }
+            par_expect(p, TOK_RPAREN,
+                "expected ')' to close parameter list");
+            par_expect(p, TOK_LBRACE,
+                "expected '{' to open function body");
+            stmt->left = parse_block(p);   /* body */
+            par_expect(p, TOK_RBRACE,
+                "expected '}' to close function body");
+        }
+
+        /* ── ফিরাও return ────────────────────────────────────────────── */
+        else if (t->kind == TOK_KEYWORD && strcmp(t->text, KW_RETURN) == 0) {
+            par_advance(p);
+            stmt = ast_new(NODE_RETURN, t->line);
+            /* Return value is optional — if next token starts a statement
+               boundary ('}', keyword, EOF) treat as "return 0"            */
+            Token *nx = par_peek(p);
+            int at_boundary = (nx->kind == TOK_RBRACE ||
+                               nx->kind == TOK_EOF    ||
+                               nx->kind == TOK_KEYWORD);
+            stmt->left = at_boundary ? NULL : parse_expr(p);
         }
 
         /* ── Unknown ─────────────────────────────────────────────────── */
@@ -687,6 +817,9 @@ static ASTNode *parse_program(void) {
     }
     return block;
 }
+
+/* exec_program — defined after the evaluator (needs exec and g_return) */
+static void exec_program(const ASTNode *block);
 
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -759,34 +892,199 @@ static int val_truthy(const Val *v) {
     return 0;
 }
 
-/* ── Variable store ─────────────────────────────────────────────────── */
+/* ── Scope stack ────────────────────────────────────────────────────── */
+/*
+ * All variables live in one flat pool (g_var_pool[]).  A scope "frame"
+ * records the pool index at which that scope starts; pop_scope() simply
+ * restores the pool top to the saved value, discarding the inner vars.
+ *
+ * Lookup walks frames from innermost (top) to outermost (0), searching
+ * each slice of the pool so inner bindings shadow outer ones.
+ * Assignment updates an existing binding wherever it lives, or creates a
+ * new one in the current (innermost) scope.
+ */
+#define MAX_SCOPE_DEPTH  256
+#define MAX_VARS_TOTAL   4096   /* total vars across ALL scopes at once     */
+
 typedef struct {
     char name[MAX_VAR_NAME];
     Val  val;
     int  used;
 } Var;
 
-static Var  g_vars[MAX_VARS];
-static int  g_var_count = 0;
+static Var g_var_pool[MAX_VARS_TOTAL];
+static int g_var_top = 0;             /* next free slot in the pool          */
 
+/* Frame stack: each entry is the pool index where that scope begins. */
+static int g_frames[MAX_SCOPE_DEPTH + 1];
+static int g_frame_top = 0;          /* current frame index (0 = global)    */
+
+static void scope_init(void) {
+    g_var_top   = 0;
+    g_frame_top = 0;
+    g_frames[0] = 0;
+}
+
+static void push_scope(void) {
+    if (g_frame_top >= MAX_SCOPE_DEPTH - 1)
+        die(0, "scope nesting limit exceeded");
+    g_frame_top++;
+    g_frames[g_frame_top] = g_var_top;  /* new scope starts here in pool    */
+}
+
+static void pop_scope(void) {
+    if (g_frame_top == 0)
+        die(0, "internal error: cannot pop global scope");
+    g_var_top = g_frames[g_frame_top];  /* discard vars of the popped scope  */
+    g_frame_top--;
+}
+
+/* Forward declaration — defined after the call-stack section below.      */
+static int call_barrier(void);
+
+/* Search innermost scope first, then outward — but stop at call barrier.
+ * Frames ABOVE the barrier (local to the current call) are always searched.
+ * Frames AT OR BELOW the barrier are caller frames and are skipped —
+ * EXCEPT frame 0, which is the program top-level (global) scope and is
+ * always visible.                                                         */
 static Var *var_find(const char *name) {
-    for (int i = 0; i < g_var_count; i++)
-        if (g_vars[i].used && strcmp(g_vars[i].name, name) == 0)
-            return &g_vars[i];
+    int barrier = call_barrier();
+    for (int f = g_frame_top; f >= 0; f--) {
+        /* Skip caller's frames (between barrier and the call's own frames),
+           but always search the very bottom frame (true global scope).    */
+        if (f > 0 && f <= barrier) continue;
+        int start = g_frames[f];
+        int end   = (f == g_frame_top) ? g_var_top : g_frames[f + 1];
+        for (int i = start; i < end; i++)
+            if (g_var_pool[i].used && strcmp(g_var_pool[i].name, name) == 0)
+                return &g_var_pool[i];
+    }
     return NULL;
 }
 
+/*
+ * If the variable exists in any visible scope, update it there.
+ * Otherwise create a new binding in the current (innermost) scope.
+ */
 static Var *var_set(const char *name, Val v, int line) {
     Var *var = var_find(name);
-    if (!var) {
-        if (g_var_count >= MAX_VARS)
-            die(line, "variable limit exceeded");
-        var = &g_vars[g_var_count++];
-        snprintf(var->name, MAX_VAR_NAME, "%.*s", MAX_VAR_NAME - 1, name);
-        var->used = 1;
+    if (var) {
+        var->val = v;
+        return var;
     }
-    var->val = v;
+    if (g_var_top >= MAX_VARS_TOTAL)
+        die(line, "variable limit exceeded");
+    var = &g_var_pool[g_var_top++];
+    snprintf(var->name, MAX_VAR_NAME, "%.*s", MAX_VAR_NAME - 1, name);
+    var->used = 1;
+    var->val  = v;
     return var;
+}
+
+/*
+ * var_set_local — always creates a new binding in the CURRENT scope,
+ * even if the same name exists in an outer scope.  Used to bind function
+ * parameters so they shadow any outer variable of the same name without
+ * mutating it.
+ */
+static Var *var_set_local(const char *name, Val v, int line) {
+    if (g_var_top >= MAX_VARS_TOTAL)
+        die(line, "variable limit exceeded");
+    Var *var = &g_var_pool[g_var_top++];
+    snprintf(var->name, MAX_VAR_NAME, "%.*s", MAX_VAR_NAME - 1, name);
+    var->used = 1;
+    var->val  = v;
+    return var;
+}
+
+/* ── Scope barrier (call frames) ────────────────────────────────────── */
+/*
+ * When a function is called we push a "call frame" — a scope that is
+ * opaque to var_find so that the function body cannot accidentally read
+ * or mutate the caller's locals.  We implement this by recording a
+ * "barrier index": var_find stops searching when it reaches a frame whose
+ * index is at or below the barrier.
+ *
+ *  g_call_barrier_stack[] stores the g_frame_top value at the point each
+ *  function call started.  var_find only searches frames [barrier+1 ..
+ *  g_frame_top], which are exactly the frames local to the current call.
+ *  The global scope (frame 0) is always visible — it sits below every
+ *  barrier, so we special-case it in var_find.
+ */
+#define MAX_CALL_DEPTH  256
+
+static int g_call_barriers[MAX_CALL_DEPTH + 1];
+static int g_call_depth = 0;
+
+static void call_push_barrier(void) {
+    if (g_call_depth >= MAX_CALL_DEPTH)
+        die(0, "maximum call depth exceeded (recursion too deep?)");
+    g_call_barriers[g_call_depth++] = g_frame_top;
+}
+
+static void call_pop_barrier(void) {
+    if (g_call_depth == 0)
+        die(0, "internal error: call barrier underflow");
+    g_call_depth--;
+}
+
+/* The frame index that var_find must not cross (exclusive lower bound).
+   We always allow the global scope (frame 0). */
+static int call_barrier(void) {
+    return (g_call_depth > 0) ? g_call_barriers[g_call_depth - 1] : -1;
+}
+
+/* ── Function table ─────────────────────────────────────────────────── */
+#define MAX_FUNCS  256
+
+typedef struct {
+    char            name[MAX_VAR_NAME];
+    int             arity;
+    char            params[MAX_PARAMS][MAX_VAR_NAME];
+    const ASTNode  *body;   /* NODE_BLOCK — not owned, points into AST pool */
+    int             defined;
+} FuncDef;
+
+static FuncDef g_funcs[MAX_FUNCS];
+static int     g_func_count = 0;
+
+static FuncDef *func_find(const char *name) {
+    for (int i = 0; i < g_func_count; i++)
+        if (g_funcs[i].defined && strcmp(g_funcs[i].name, name) == 0)
+            return &g_funcs[i];
+    return NULL;
+}
+
+static void func_register(const ASTNode *decl) {
+    if (func_find(decl->text))
+        die(decl->line, "function already defined");
+    if (g_func_count >= MAX_FUNCS)
+        die(decl->line, "function limit exceeded");
+    FuncDef *f = &g_funcs[g_func_count++];
+    snprintf(f->name, MAX_VAR_NAME, "%.*s", MAX_VAR_NAME - 1, decl->text);
+    f->arity = decl->param_count;
+    for (int i = 0; i < decl->param_count; i++)
+        snprintf(f->params[i], MAX_VAR_NAME, "%s",
+                 g_param_pool[decl->param_base + i]);
+    f->body    = decl->left;   /* NODE_BLOCK */
+    f->defined = 1;
+}
+
+/* ── Return signal ──────────────────────────────────────────────────── */
+/*
+ * Rather than using setjmp/longjmp or exceptions, we use a simple flag.
+ * exec() checks g_return.active after every statement and bails out early
+ * if it is set.  call_function() clears the flag after the call returns.
+ */
+typedef struct {
+    int active;   /* 1 = ফিরাও has been executed, unwind in progress       */
+    Val value;    /* the value being returned                                */
+} ReturnSignal;
+
+static ReturnSignal g_return = {0, {0, 0, 0, ""}};
+
+static void return_signal_clear(void) {
+    g_return.active = 0;
 }
 
 
@@ -796,6 +1094,36 @@ static Var *var_set(const char *name, Val v, int line) {
 
 static Val  eval(const ASTNode *node);       /* forward decl               */
 static void exec(const ASTNode *node);       /* forward decl               */
+
+/* ── Function call dispatch ─────────────────────────────────────────── */
+static Val call_function(const FuncDef *f, const ASTNode *call_node,
+                         Val *argv, int argc) {
+    if (argc != f->arity)
+        die(call_node->line, "wrong number of arguments");
+
+    /* Save scope state, push a call barrier so the callee cannot see
+       the caller's local variables (only globals in frame 0 stay visible) */
+    call_push_barrier();
+    push_scope();   /* the function's own local scope                       */
+
+    /* Bind parameters as locals in the new scope */
+    for (int i = 0; i < f->arity; i++)
+        var_set_local(f->params[i], argv[i], call_node->line);
+
+    /* Execute the function body */
+    return_signal_clear();
+    exec(f->body);
+
+    /* Capture return value (default to 0 if no ফিরাও was hit) */
+    Val result = g_return.active ? g_return.value : make_num(0.0);
+    return_signal_clear();
+
+    /* Restore scope */
+    pop_scope();
+    call_pop_barrier();
+
+    return result;
+}
 
 /* ── Expression evaluator ───────────────────────────────────────────── */
 static Val eval(const ASTNode *node) {
@@ -811,6 +1139,19 @@ static Val eval(const ASTNode *node) {
             Var *v = var_find(node->text);
             if (!v) die_tok(node->line, "undefined variable", node->text);
             return v->val;
+        }
+
+        /* ── Function call ────────────────────────────────────────────── */
+        case NODE_FUNC_CALL: {
+            FuncDef *f = func_find(node->text);
+            if (!f) die_tok(node->line, "undefined function", node->text);
+            if (node->param_count != f->arity)
+                die(node->line, "wrong number of arguments");
+            /* Evaluate all arguments before pushing scope */
+            Val argv[MAX_PARAMS];
+            for (int i = 0; i < node->param_count; i++)
+                argv[i] = eval(g_arg_pool[node->arg_base + i]);
+            return call_function(f, node, argv, node->param_count);
         }
 
         /* ── Arithmetic binary op ─────────────────────────────────────── */
@@ -917,11 +1258,15 @@ static void exec(const ASTNode *node) {
 
         /* ── Block (sequence of statements) ──────────────────────────── */
         case NODE_BLOCK: {
+            push_scope();
             ASTNode *s = node->left;
             while (s) {
                 exec(s);
+                /* Propagate return signal: stop executing further stmts   */
+                if (g_return.active) break;
                 s = s->next;
             }
+            pop_scope();
             break;
         }
 
@@ -943,12 +1288,11 @@ static void exec(const ASTNode *node) {
 
         /* ── If / else ────────────────────────────────────────────────── */
         case NODE_IF: {
-            Val cond = eval(node->left);
+            Val cond = eval(node->cond);
             if (val_truthy(&cond)) {
-                exec(node->right);           /* then body  */
-            } else {
-                ASTNode *else_body = node->right->next;
-                if (else_body) exec(else_body);
+                exec(node->then_branch);
+            } else if (node->else_branch) {
+                exec(node->else_branch);
             }
             break;
         }
@@ -960,6 +1304,7 @@ static void exec(const ASTNode *node) {
                 Val cond = eval(node->left);
                 if (!val_truthy(&cond)) break;
                 exec(node->right);
+                if (g_return.active) break;   /* ফিরাও inside loop         */
                 if (++guard > 10000000)
                     die(node->line,
                         "loop exceeded 10,000,000 iterations — "
@@ -968,9 +1313,36 @@ static void exec(const ASTNode *node) {
             break;
         }
 
+        /* ── Function declaration ─────────────────────────────────────── */
+        case NODE_FUNC_DECL: {
+            func_register(node);
+            break;
+        }
+
+        /* ── Return statement ─────────────────────────────────────────── */
+        case NODE_RETURN: {
+            g_return.value  = node->left ? eval(node->left) : make_num(0.0);
+            g_return.active = 1;
+            break;
+        }
+
         default:
             die(node->line,
                 "internal error: exec() called on non-statement node");
+    }
+}
+
+/*
+ * exec_program — runs the top-level block WITHOUT pushing a new scope,
+ * so all top-level variable declarations land in frame 0 (the true global
+ * scope) and remain visible inside function calls across call barriers.
+ */
+static void exec_program(const ASTNode *block) {
+    ASTNode *s = block->left;
+    while (s) {
+        exec(s);
+        if (g_return.active) break;
+        s = s->next;
     }
 }
 
@@ -1005,14 +1377,19 @@ static void run_file(const char *path) {
     fclose(f);
 
     lex(g_source_lines, g_source_count);
+    scope_init();
+    g_func_count      = 0;
+    g_param_pool_top  = 0;
+    g_arg_pool_top    = 0;
+    return_signal_clear();
     ASTNode *program = parse_program();
-    exec(program);
+    exec_program(program);
 }
 
 /* REPL — parse and run one logical statement at a time.
    Multi-line constructs (if / while) are accumulated until '}' is seen. */
 static void run_repl(void) {
-    printf("Matrika v3.0  —  type 'বিদায়' to exit\n");
+    printf("Matrika v4.0  —  type 'বিদায়' to exit\n");
     printf("------------------------------------------\n");
 
     char line[MAX_LINE_LEN];
@@ -1022,6 +1399,7 @@ static void run_repl(void) {
     int    repl_count = 0;
     int    brace_depth = 0;
     int    global_line = 0;
+    scope_init();
 
     while (1) {
         printf(brace_depth > 0 ? "...       " : "matrika>  ");
@@ -1058,7 +1436,7 @@ static void run_repl(void) {
             lex(repl_lines, repl_count);
             if (g_tok_count > 0) {
                 ASTNode *program = parse_program();
-                exec(program);
+                exec_program(program);
             }
             repl_count = 0;
         }

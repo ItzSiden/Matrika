@@ -1,105 +1,20 @@
-1️⃣ Clean AST Structure (Mandatory)
-
-Fix NODE_IF.
-
-🔧 Do this:
-
-Change ASTNode:
-
-Instead of abusing next for else body, modify struct:
-
-ASTNode *cond;
-ASTNode *then_branch;
-ASTNode *else_branch;
-
-Update:
-
-Parser
-
-Evaluator
-
-✅ Result: Cleaner logic, future-proof.
-
-2️⃣ Implement Proper Scope System (CRITICAL)
-
-Right now variables are global.
-
-🔧 Replace:
-g_vars[]
-
-With:
-
-Scope stack
-
-Structure idea:
-
-Scope {
-   Var vars[]
+কাজ ফ্যাক্টরিয়াল(n) {
+    যদি n <= 1 {
+        ফিরাও 1
+    } নাহলে {
+        ফিরাও n * ফ্যাক্টরিয়াল(n - 1)
+    }
 }
 
-Maintain:
+বল(ফ্যাক্টরিয়াল(5))   # 120
+বল(ফ্যাক্টরিয়াল(7))   # 5040
 
-push_scope()
+recursion is taking too long. (Larger Factorials)
+var updating not working. (i + 1), (i++)
+scope: temp.matrika:8: error: unknown statement: 'দেখাও'
 
-pop_scope()
 
-var_lookup() should search from top → down
 
-Push scope when:
-
-Entering block
-
-Entering function
-
-Pop when:
-
-Leaving block
-
-Returning from function
-
-✅ Without this, functions will break everything.
-
-3️⃣ Add User Defined Functions
-
-After scope system works.
-
-🔧 Add new node types:
-
-NODE_FUNC_DECL
-
-NODE_FUNC_CALL
-
-NODE_RETURN
-
-Example syntax idea:
-
-কাজ যোগ(a, b) {
-    ফিরাও a + b
-}
-
-Need:
-
-Function table
-
-Call stack
-
-Local scope per call
-
-Return handling
-
-4️⃣ Implement Return Statement
-
-Add:
-
-ফিরাও <expr>
-
-Evaluator must:
-
-Stop executing current function
-
-Pass value back
-
-Unwind scope
 
 5️⃣ Refactor ASTNode (Optional but Good)
 
@@ -149,6 +64,6 @@ Inside main:
 
 Print:
 
-Matrika v4.0
+Matrika v1.0
 
 Keep version discipline.
